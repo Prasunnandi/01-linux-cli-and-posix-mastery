@@ -1,160 +1,272 @@
-# 🔍 Day 3: Searching Logs with `grep` & Regular Expression Theory
+# Day 03: Fast Text Searching with `grep`: Regular Grammars, Thompson NFA, Boyer-Moore & ReDoS Physics
 
-> **Zero External Dependency Guarantee**: This document is an exhaustive, encyclopedic masterclass. It contains complete historical context, Ken Thompson's 1968 NFA mathematical algorithm, Boyer-Moore string search heuristics, catastrophic backtracking mechanics, the 2019 global Cloudflare outage case study, and FAANG technical interview questions. You do NOT need any textbook or external website.
-
----
-
-## 1. Executive Summary & Historical Context
-
-In 1968, computer pioneer Ken Thompson published a seminal paper in the *Communications of the ACM* titled:  
-**"Regular Expression Search Algorithm"**.
-
-Before Thompson's breakthrough, searching text for complex patterns was painfully slow and prone to combinatorial explosions. Thompson proved that any regular expression could be converted into a mathematical state machine called a **Nondeterministic Finite Automaton (NFA)** that could scan a document of $N$ characters in strictly **$O(N)$ linear time**, regardless of how complex the pattern was.
-
-When Thompson created the Unix text editor **`ed`** in 1971, he added the command:
-$$\mathbf{g} / \text{re} / \mathbf{p}$$
-*(Globally search for Regular Expression and Print matching lines)*.
-
-In 1973, Dennis Ritchie and Ken Thompson extracted this algorithm into a standalone binary: **`grep`**. Today, `grep` is the primary diagnostic tool used by Site Reliability Engineers (SREs) and software engineers across the globe.
+> **Zero External Dependency Guarantee**: This document is an encyclopedic, self-contained masterclass. It contains formal automata theory, Thompson's NFA $\\epsilon$-closure mathematics, Boyer-Moore shift formula proofs, GNU Grep algorithmic optimizations, C and Python implementations, real-world Cloudflare ReDoS post-mortems, and FAANG staff-level interview questions. You do NOT need any textbook or external website.
 
 ---
 
-## 2. Automata Theory: How Regex Engines Work Under the Hood
+## 1. Executive Summary & Historical Origins
 
-There are two fundamentally different types of regular expression engines in the software industry:
+The name **`grep`** was coined in 1973 by Ken Thompson at Bell Labs. In the original Unix text editor `ed`, the command to globally search for a regular expression and print matching lines was:
+$$\mathbf{g/re/p} \quad \implies \quad \mathbf{g}\text{lobal} \ / \ \mathbf{r}\text{egular } \mathbf{e}\text{xpression} \ / \ \mathbf{p}\text{rint}$$
+
+Thompson extracted this search routine into a standalone executable. Today, `grep` is the world's most ubiquitous text search tool, capable of scanning multi-terabyte log streams faster than the raw transfer rate of modern disks.
 
 ```
-                       REGULAR EXPRESSION ENGINES
-          ┌──────────────────────────────────────────────────┐
-          │                                                  │
-          ▼                                                  ▼
-   THOMPSON NFA / DFA ENGINES                     BACKTRACKING ENGINES
-   (GNU grep, Google RE2, Go)               (Python re, Java, PCRE, JavaScript)
-   ──────────────────────────               ───────────────────────────────────
-   • Converts regex into finite state machine• Tries a path, backtracks on failure
-   • Guaranteed O(N) LINEAR TIME            • Exponential O(2^N) WORST CASE
-   • Immune to ReDoS outages                • Vulnerable to Catastrophic Backtracking
+THE EVOLUTION OF STRING & PATTERN SEARCH:
++---------------------+      Substring Search       +-----------------------------+
+| Exact String Match  | --------------------------> | Boyer-Moore Algorithm (1977)|
++---------------------+                             +-----------------------------+
+           |
+           v Regular Expression Grammars
++---------------------+      State Automata         +-----------------------------+
+| Pattern Matching    | --------------------------> | Thompson NFA / Aho-Corasick |
++---------------------+                             +-----------------------------+
 ```
-
-### 1. The Catastrophic Backtracking Trap (ReDoS)
-Consider the pattern: `(a+)+$` and the input string:
-`aaaaaaaaaaaaaaaaaaaaaaaaaaaaab` (29 'a's followed by a 'b').
-
-* A backtracking engine (like standard Python or JavaScript) matches the first group of `a`s. When it reaches the final `b`, the match fails.
-* It backtracks and tries dividing the 29 `a`s into different subgroup combinations: $(28+1)$, $(27+2)$, $(27+1+1)$...
-* The number of combinations to check is $2^{29} = \mathbf{536,870,912\text{ steps}}$!
-* A modern 4.0 GHz CPU will freeze at 100% load for **over 3 minutes** evaluating a single 30-character string! This vulnerability is called a **ReDoS (Regular Expression Denial of Service)** attack.
-
-### 2. The Thompson NFA Solution (Why `grep` Never Freezes)
-Thompson's algorithm runs all possible states **in parallel at the exact same time**:
-* For each incoming character in the text, the algorithm updates a list of "current active states".
-* Each character in the input file is inspected **exactly once**.
-* Worst-case time complexity is mathematically bounded at:
-  $$\mathcal{O}(N \times M)$$
-  *(Where $N$ is file size, and $M$ is regex pattern length)*. It is physically impossible to crash GNU `grep` with ReDoS!
 
 ---
 
-## 3. String Search Algorithms: How GNU `grep` Skips Bytes
+## 2. Automata Theory: NFAs, DFAs & Thompson's Construction
 
-When you search for a literal string (e.g. `grep "DATABASE_ERROR" app.log`), GNU `grep` is substantially faster than even standard C string functions like `strstr()`.
+A regular expression is a declarative syntax for defining a **Regular Language** over an alphabet $\\Sigma$ (Chomsky Hierarchy Type-3 Grammar). To execute a search on physical hardware, the regular expression must be compiled into a state machine.
 
-How does it achieve this? It uses the **Boyer-Moore String Search Algorithm**!
+### 2.1 NFA vs. DFA: The Fundamental Trade-off
+* **NFA (Nondeterministic Finite Automaton)**:
+  - Can exist in multiple states simultaneously via **$\\epsilon$-transitions** (state transitions that consume zero input characters).
+  - Memory required to represent the machine: **$O(M)$** where $M$ is the length of the pattern. Fast compilation!
+  - Execution time per character: **$O(M)$**, giving total search time **$O(N \cdot M)$**.
+* **DFA (Deterministic Finite Automaton)**:
+  - For any given state and input character, there is **exactly one** deterministic next state.
+  - Execution time per character: **$O(1)$**, giving blazing linear search time **$O(N)$** independent of pattern complexity!
+  - Memory required to represent the machine: In the worst case, converting an NFA to a DFA requires the **Subset Construction Algorithm** (Powerset Construction), which can create up to **$2^M$ states** (state explosion).
 
 ```
-Text:     [ S E R V E R _ S T A R T E D _ W I T H _ E R R O R ]
-Pattern:  [ D A T A B A S E ]
-                     ▲
-                     │ (Mismatch! 'S' is not in "DATABASE")
-                     ▼
-         JUMP FORWARD 8 BYTES IMMEDIATELY! (Never read the intermediate letters!)
+COMPARISON MATRIX: REGEX SEARCH ENGINES
++-------------------------+-------------------------+-------------------------+
+| Feature                 | Thompson NFA / DFA      | Backtracking Engines    |
+|                         | (GNU grep, RE2, Go)     | (PCRE, Python re, Perl) |
++-------------------------+-------------------------+-------------------------+
+| Time Complexity (Worst) | O(N) Guaranteed Linear  | O(2^N) Exponential!     |
+| Memory Bound            | O(M) or O(2^M states)   | O(Recursion Depth)      |
+| Catastrophic ReDoS Risk | ZERO (Immune to ReDoS)  | SEVERE (Server Halting) |
+| Backreferences support  | No (Not Regular Grammars)| Yes                     |
+| Lookaround Assertions   | No                      | Yes                     |
++-------------------------+-------------------------+-------------------------+
 ```
 
-### The Two Boyer-Moore Heuristics:
-1. **The Bad Character Heuristic**:
-   * Boyer-Moore scans the search pattern from **right to left** (tail first).
-   * If the character in the text does not exist anywhere in the pattern, `grep` immediately skips forward by the entire length of the pattern! It doesn't even bother reading the intervening characters in memory!
-2. **The Good Suffix Heuristic**:
-   * If a partial suffix matches, but an earlier letter mismatches, it shifts the pattern to align with the next occurrence of that suffix.
+### 2.2 Thompson's Construction Algorithm
+Invented by Ken Thompson in 1968, this algorithm constructs an equivalent NFA from a regular expression in $O(M)$ time using basic building blocks:
 
-Because of Boyer-Moore, searching a 10GB file with `grep` often reads **less than 20% of the physical bytes** in the file!
+```
+THOMPSON'S NFA STRUCTURAL ATOMS:
+
+1. Literal Character 'a':
+   [ State 1 ] --- 'a' ---> [ (State 2) ]
+
+2. Concatenation 'ab':
+   [ State 1 ] --- 'a' ---> [ State 2 ] --- 'b' ---> [ (State 3) ]
+
+3. Alternation 'a|b':
+                +--- e ---> [ State 2 ] --- 'a' ---> [ State 3 ] --- e ---+
+                |                                                         v
+   [ State 1 ] -+                                                       [ (State 6) ]
+                |                                                         ^
+                +--- e ---> [ State 4 ] --- 'b' ---> [ State 5 ] --- e ---+
+
+4. Kleene Star 'a*':
+                     +----------------- e -----------------+
+                     |                                     v
+   [ State 1 ] --- e ---> [ State 2 ] --- 'a' ---> [ State 3 ] --- e ---> [ (State 4) ]
+                               ^                     |
+                               +--------- e ---------+
+```
 
 ---
 
-## 4. The 3 Variants: `grep` vs `egrep` vs `fgrep`
+## 3. Substring Search Physics: The Boyer-Moore Algorithm
 
-POSIX systems provide three distinct modes for text searching:
+When searching for a fixed string (e.g., `grep -F "ERROR"` or `fgrep`), `grep` switches from automata engines to the **Boyer-Moore Algorithm** (or its optimized variant, Boyer-Moore-Horspool).
 
-| Command | Equivalent Flag | Engine / Algorithm | When to Use in Production |
-| :---: | :---: | :---: | :--- |
-| **`grep`** | Standard | Basic Regular Expressions (BRE) | Default search. Metacharacters like `(`, `)`, `+`, `?` require backslashes (`\+`, `\?`). |
-| **`egrep`** | **`grep -E`** | Extended Regular Expressions (ERE) | Complex patterns! Full support for unescaped `+`, `?`, `|`, and `(grouping)`. |
-| **`fgrep`** | **`grep -F`** | Fixed Strings (Aho-Corasick) | **Maximum Speed!** Treats all characters as literal text (no regex parsing overhead). Searches for 1,000 literal words simultaneously! |
+### 3.1 The Backward Scanning Principle
+Most naive search algorithms compare characters from left to right. Boyer-Moore aligns the pattern with the text and compares characters **from right to left (end of pattern backwards)**!
+* If the character in the text does not appear anywhere in the pattern, the entire pattern can skip forward by $M$ characters in a single step!
+* Boyer-Moore can search text in **sub-linear time**: on average, it inspects only $N / M$ characters.
 
----
+```
+BOYER-MOORE SKIP MECHANISM:
+Text:      [ T ][ R ][ A ][ N ][ S ][ A ][ C ][ T ][ I ][ O ][ N ]
+Pattern:   [ E ][ R ][ R ][ O ][ R ]
+                                 ^
+                                 Mismatch! 'S' is not in "ERROR".
+                                 We can instantly shift forward by 5 positions!
 
-## 5. Real-World Production War Story: The 2019 Global Cloudflare Outage
-
-### The Incident:
-On July 2, 2019, at 13:42 UTC, **12% of the entire global internet went offline**. Millions of websites (including Discord, Shopify, Coinbase, and Medium) returned 502 Bad Gateway errors.  
-The cause was not a cyberattack, a fiber optic cable cut, or a hurricane.  
-The cause was a **single regular expression in a Web Application Firewall (WAF) rule** deployed to production:
-
-```regex
-(?:(?:\"|'|\]|\}|\\d|(?:nan|infinity))\s*(?:(?:(?:(?:(?:(?:(?:(?:in|instanceof)\s*(?:(?:\"[^\"]*\")|(?:'[^']*')|(?:\/[^\/]*\/)|(?:[^\s]*)))\s*(?:(?:(?:\+|-|~|!)\s*)|(?:(?:\+\+|--)\s*)|))|(?:(?:(?:(?:\+|-|~|!)\s*)|(?:(?:\+\+|--)\s*)|)(?:(?:\"[^\"]*\")|(?:'[^']*')|(?:\/[^\/]*\/)|(?:[^\s]*))\s*(?:(?:in|instanceof)\s*(?:(?:\"[^\"]*\")|(?:'[^']*')|(?:\/[^\/]*\/)|(?:[^\s]*)))\s*))|(?:(?:(?:(?:\+|-|~|!)\s*)|(?:(?:\+\+|--)\s*)|)(?:(?:\"[^\"]*\")|(?:'[^']*')|(?:\/[^\/]*\/)|(?:[^\s]*))\s*(?:(?:in|instanceof)\s*(?:(?:\"[^\"]*\")|(?:'[^']*')|(?:\/[^\/]*\/)|(?:[^\s]*)))(?:\s*(?:(?:(?:\+|-|~|!)\s*)|(?:(?:\+\+|--)\s*)|))))(?:\s*(?:(?:(?:\+|-|~|!)\s*)|(?:(?:\+\+|--)\s*)|))?\s*)*
+Shifted:   [ T ][ R ][ A ][ N ][ S ][ A ][ C ][ T ][ I ][ O ][ N ]
+                                     [ E ][ R ][ R ][ O ][ R ]
 ```
 
-### What Happened Under the Hood:
-The rule contained nested un-anchored quantifiers: `.*.*=.*`.  
-When an HTTP request containing whitespace arrived, the backtracking PCRE regex engine entered an exponential backtracking loop. CPU utilization on Cloudflare's core edge servers jumped to **100% across all cores worldwide**, starving the NGINX event loops and dropping all global HTTP traffic for 27 minutes.
+### 3.2 The Bad Character Rule Mathematical Formula
+For a mismatched character $c$ in the text at pattern position $j$:
+$$\\text{Shift}_{\\text{bad}}(c) = \\max(1, \ j - \\text{last\_occurrence}(c))$$
 
-### The Takeaway for Engineers:
-* Understand the regex engine you are running in production.
-* If user-supplied input is matched against regular expressions, **always use an engine with guaranteed linear time (Thompson NFA / RE2)** or set strict execution timeouts!
+If $c$ does not exist in the pattern, $\\text{last\_occurrence}(c) = -1$, yielding a massive jump of $j - (-1) = j + 1$.
+
+### 3.3 Why GNU Grep is Faster Than Everything Else
+In 2010, Mike Haertel (the original author of GNU Grep) published his famous architectural explanation of why GNU Grep outperforms custom C code:
+1. **Never Look at Every Byte**: Boyer-Moore skips huge swaths of input bytes.
+2. **Unrolled Inner Loops**: The inner character comparison loop is unrolled to keep CPU pipelines saturated without branch mispredictions.
+3. **Buffer Boundaries via Sentinels**: Instead of checking `if (ptr >= end_of_buffer)` on every character, GNU Grep appends a newline and the search pattern itself to the end of the memory buffer. The search loop runs without bounds checking until a hit occurs!
+4. **Zero-Copy Page Cache Access**: GNU Grep uses `mmap()` or large 64KB page-aligned buffers to avoid userspace memory copies.
 
 ---
 
-## 6. Staff-Level Technical Interview Deep-Dives
+## 4. Complete C Implementation: Boyer-Moore-Horspool String Searcher
 
-### Question 1: How does GNU `grep` use `mmap()` versus `read()` for file searching?
-**Exhaustive Answer**:
-* For large regular files, GNU `grep` avoids calling `read()` repeatedly into a small buffer. Instead, it uses the **`mmap()`** system call to map the physical file directly into the process's virtual address space.
-* The Linux kernel's Memory Management Unit (MMU) loads the pages into RAM via demand paging as the Boyer-Moore search algorithm scans forward.
-* This eliminates the memory copy from kernel page cache to user-space memory, allowing `grep` to run at the maximum sequential read speed of the underlying NVMe SSD (up to $7\text{ GB/sec}$).
+```c
+/**
+ * boyer_moore_search.c - Production-grade Boyer-Moore-Horspool pattern searcher.
+ * Compile: gcc -Wall -Wextra -O3 boyer_moore_search.c -o bm_search
+ */
 
-### Question 2: Implement a minimal Regular Expression matcher in C/Python for `.` and `*`.
-**Exhaustive Answer**:
-The classic Brian Kernighan algorithm from *The Practice of Programming*:
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define ALPHABET_SIZE 256
+
+/* Precompute Bad Character Shift Table */
+void precompute_bad_char(const char *pattern, int pattern_len, int bad_char[ALPHABET_SIZE]) {
+    for (int i = 0; i < ALPHABET_SIZE; i++) {
+        bad_char[i] = pattern_len; // Default shift is the full pattern length
+    }
+    for (int i = 0; i < pattern_len - 1; i++) {
+        bad_char[(unsigned char)pattern[i]] = pattern_len - 1 - i;
+    }
+}
+
+/* Boyer-Moore-Horspool Search Routine */
+void search_stream(FILE *stream, const char *pattern) {
+    int m = strlen(pattern);
+    if (m == 0) return;
+
+    int bad_char[ALPHABET_SIZE];
+    precompute_bad_char(pattern, m, bad_char);
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    unsigned long line_num = 0;
+
+    while ((linelen = getline(&line, &linecap, stream)) > 0) {
+        line_num++;
+        int n = (int)linelen;
+        int i = 0;
+
+        while (i <= n - m) {
+            int j = m - 1;
+
+            // Match from right to left
+            while (j >= 0 && pattern[j] == line[i + j]) {
+                j--;
+            }
+
+            if (j < 0) {
+                // Match found!
+                printf("Line %lu: %s", line_num, line);
+                break; // Move to next line
+            }
+
+            // Shift based on the bad character at the end of the window
+            i += bad_char[(unsigned char)line[i + m - 1]];
+        }
+    }
+    free(line);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <pattern> [file]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    const char *pattern = argv[1];
+    if (argc == 2) {
+        search_stream(stdin, pattern);
+    } else {
+        FILE *fp = fopen(argv[2], "r");
+        if (!fp) {
+            perror(argv[2]);
+            return EXIT_FAILURE;
+        }
+        search_stream(fp, pattern);
+        fclose(fp);
+    }
+    return EXIT_SUCCESS;
+}
+```
+
+---
+
+## 5. Python High-Performance Regex vs Linear Thompson NFA
+
+Python's standard `re` module uses a backtracking engine (written in C). While rich in features, it is vulnerable to exponential time explosions. For mission-critical linear-time guarantees, the `google-re2` engine compiles regular expressions directly into DFAs:
+
 ```python
-def match(regexp, text):
-    if regexp == "": return True
-    if regexp[0] == "^": return match_here(regexp[1:], text)
-    while text:
-        if match_here(regexp, text): return True
-        text = text[1:]
-    return False
+import time
+import re
 
-def match_here(regexp, text):
-    if regexp == "": return True
-    if len(regexp) > 1 and regexp[1] == "*":
-        return match_star(regexp[0], regexp[2:], text)
-    if regexp == "$" and text == "": return True
-    if text and (regexp[0] == "." or regexp[0] == text[0]):
-        return match_here(regexp[1:], text[1:])
-    return False
+# Benchmark: Catastrophic Backtracking vs Linear Execution
+pattern_backtrack = r"^(a+)+$"
+regex_evil = re.compile(pattern_backtrack)
 
-def match_star(char, regexp, text):
-    while True:
-        if match_here(regexp, text): return True
-        if not text or (text[0] != char and char != "."): return False
-        text = text[1:]
+test_string = "a" * 28 + "!" # 28 'a' characters followed by a mismatch
+
+print(f"Testing regex '{pattern_backtrack}' against length {len(test_string)} string...")
+start = time.perf_counter()
+match = regex_evil.match(test_string)
+elapsed = time.perf_counter() - start
+
+print(f"Python standard 're' engine took: {elapsed:.4f} seconds!")
+# In GNU grep (grep -E "^(a+)+$"), this takes less than 0.0001 seconds because
+# GNU grep uses DFA simulation without backtracking!
 ```
 
 ---
 
-## 7. Complete Verification Checklist (Zero Gaps)
-Before marking Day 3 as completed in your tracker, verify that you can answer these without looking:
-- [ ] Can you explain the difference between a Thompson NFA engine and an exponential backtracking engine?
-- [ ] What is Catastrophic Backtracking (ReDoS) and what mathematical pattern causes it?
-- [ ] How does the Boyer-Moore Bad Character heuristic allow `grep` to skip bytes without reading them?
-- [ ] What is the difference between `grep`, `grep -E`, and `grep -F`?
+## 6. Real-World Production War Stories
+
+### 6.1 War Story 1: The 2019 Cloudflare 27-Minute Global Outage (ReDoS)
+* **The Incident**: On July 2, 2019, at 13:42 UTC, Cloudflare's global network CPU spiked to 100% across all datacenters worldwide, dropping over 80% of global web traffic.
+* **The Root Cause**: An engineer deployed a new WAF (Web Application Firewall) rule containing the following regular expression:
+  ```regex
+  (?:(?:"|'|]|}|\/[\*\s]*|(?:;)?\s*problem)(?:\s*\w+|[\s+]\*\/)[^&]*[a-zA-Z]+.*[a-zA-Z]+=.*)
+  ```
+* **The Physics**: The subpattern `.*.*=` contains nested Kleene stars with overlapping character classes.
+  - When presented with a string of text that had no `=` sign at the end, the PCRE backtracking engine tried every possible permutation of dividing the string between the first `.*` and the second `.*`.
+  - For a string of length $N$, the number of backtracking evaluation branches is:
+    $$\\mathcal{O}(2^N)$$
+  - For a 50-byte input, the engine required $2^{50} \approx 1.12 \times 10^{15}$ operations!
+* **The SRE Lesson**: Never use backtracking regex engines (PCRE, Python `re`) in high-throughput proxies. Always enforce DFA engines (Rust `regex`, Go `regexp`, Google `RE2`, GNU `grep`).
+
+---
+
+## 7. Staff-Level Technical Interview Deep-Dives
+
+### Question 1: What makes GNU Grep faster than a simple C program that loops with `strstr()`?
+**Exhaustive Answer**:
+1. **Algorithm**: `strstr()` in older C standard libraries implemented naive $O(N \cdot M)$ search. GNU Grep uses Boyer-Moore-Horspool, skipping multiple bytes per mismatch.
+2. **Memory Architecture**: GNU Grep aligns buffers with kernel page boundaries (4096 bytes) and uses raw unbuffered `read()` system calls into large 64KB blocks, eliminating standard library `fgetc()` function call overhead.
+3. **Inner Loop Sentinel**: GNU Grep appends a copy of the search pattern as a sentinel at the end of the buffer, removing the `pointer < buffer_end` check from the inner loop.
+4. **Page Cache Optimization**: By streaming sequentially, GNU Grep triggers hardware CPU prefetchers and kernel page cache readahead.
+
+### Question 2: Why do backreferences (e.g. `([a-z]+)\1`) make regular expression matching NP-Complete?
+**Exhaustive Answer**:
+* By definition, a regular language can be recognized by a Finite State Automaton with fixed, finite memory.
+* A backreference `\1` requires the engine to remember an arbitrary, unbounded string previously matched, and verify that the subsequent string is identical.
+* This requires context-sensitive grammar capabilities (equivalent to a Turing Machine). In 1989, it was formally proven that determining whether a regular expression with backreferences matches a string is **NP-Complete**, reducible from the 3-SAT Boolean Satisfiability problem!
+
+---
+
+## 8. Complete Verification Checklist (Zero Gaps)
+- [ ] What is the origin of the word `grep` in Dennis Ritchie and Ken Thompson's `ed` editor?
+- [ ] Draw Thompson's NFA construction for alternation (`a|b`) and Kleene star (`a*`).
+- [ ] Why does the Boyer-Moore algorithm scan characters from right to left instead of left to right?
+- [ ] Calculate the bad character shift for pattern "TEST" when a mismatch occurs on character 'X'.
+- [ ] Explain how nested quantifiers `(a+)+` cause catastrophic backtracking in PCRE but linear time in GNU Grep.
