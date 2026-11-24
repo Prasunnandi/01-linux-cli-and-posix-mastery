@@ -1,184 +1,260 @@
 # Day 12: Inodes, Hard Links vs Soft Links (stat, ln)
 
-## 1. Architectural Foundations: The Inode (Index Node)
-
-In the Unix philosophy, "everything is a file." However, the operating system kernel does not recognize human-readable filenames like `financial_report.csv`. Internally, the Linux Virtual Filesystem (VFS) and storage engines (such as ext4 and XFS) identify every object using a numerical metadata structure known as the **Index Node** or **Inode**.
-
-An Inode stores all metadata describing a file, **except its filename and actual data content**.
+## 1. Architectural Foundations: The Virtual Filesystem (VFS) Layer
+In the Unix file system design, a file's name and location in the directory tree are completely decoupled from its metadata and storage blocks. The abstraction that bridges human-readable pathnames and physical disk storage consists of three fundamental kernel data structures:
 
 ```
-+-------------------------------------------------------------------------+
-|                  ext4 Inode On-Disk Structure (256 Bytes)               |
-+-------------------------------------------------------------------------+
-| Field               | Size    | Description                             |
-+---------------------+---------+-----------------------------------------+
-| i_mode              | 2 bytes | File Type (regular, dir, symlink) + ACL |
-| i_uid / i_gid       | 4 bytes | Owner User ID and Group ID              |
-| i_size_lo / hi      | 8 bytes | File Size in Bytes (supports 64-bit)    |
-| i_atime             | 4 bytes | Last Access Time                        |
-| i_ctime             | 4 bytes | Last Status Change Time (metadata)      |
-| i_mtime             | 4 bytes | Last Modification Time (content)        |
-| i_dtime             | 4 bytes | Deletion Time                           |
-| i_links_count       | 2 bytes | Reference Count of Hard Links           |
-| i_blocks_lo / hi    | 8 bytes | Number of 512-Byte Storage Blocks       |
-| i_flags             | 4 bytes | Ext4 Flags (immutable, append-only)     |
-| i_block[EXT4_N_BLKS]| 60 bytes| Extent Tree Root or Block Pointers      |
-| i_extra_isize       | 2 bytes | Extra Inode Size for Nanosecond Timestamps|
-+---------------------+---------+-----------------------------------------+
++----------------------------------------------------------------------------+
+|                         VFS (Virtual Filesystem)                           |
++----------------------------------------------------------------------------+
+       |                                                |
+       v                                                v
++-------------------+                            +-------------------+
+| struct dentry     |                            | struct dentry     |
+| d_name = "file.txt"                            | d_name = "hardlink"
+| d_inode ---------\                            / | d_inode ----------+
++-------------------\--------------------------/---------------------+
+                     |                        |
+                     v                        v
+            +---------------------------------------+
+            | struct inode                          |
+            | i_ino = 142981                        |
+            | i_nlink = 2                           |
+            | i_mode = 0100644 (S_IFREG | 0644)     |
+            | i_uid = 1000, i_gid = 1000            |
+            | i_size = 4096 bytes                   |
+            | i_blocks = 8 (512-byte sectors)       |
+            | i_atime, i_mtime, i_ctime             |
+            | Direct & Extent Tree Pointers ------> [ Data Blocks on Disk ]
+            +---------------------------------------+
 ```
 
-### 1.1 How Filenames Work: Directory Entries (Dentries)
-A directory in Linux is fundamentally just a specialized file whose payload is a list of directory entries (**dentries**). Each dentry maps a string filename to an Inode number:
+### The Inode (`struct inode`)
+The index node (inode) represents a unique filesystem object. It contains all metadata describing the file EXCEPT its name:
+- **Inode Number (`i_ino`)**: An unsigned 32-bit or 64-bit integer unique within the filesystem superblock.
+- **Link Count (`i_nlink`)**: The number of directory entries (`dentry`) that point to this inode. A file's storage blocks are not deallocated until `i_nlink == 0` AND all open file descriptors referencing the inode are closed.
+- **Type and Permissions (`i_mode`)**: Encodes the file type (regular file `S_IFREG`, directory `S_IFDIR`, symlink `S_IFLNK`, block device `S_IFBLK`, character device `S_IFCHR`, FIFO `S_IFIFO`, or socket `S_IFSOCK`) and POSIX permission bits (rwxrwxrwx).
+- **Ownership (`i_uid`, `i_gid`)**: Numeric user and group IDs.
+- **Size (`i_size`)**: Logical file size in bytes.
+- **Allocated Disk Blocks (`i_blocks`)**: Number of 512-byte blocks allocated on disk (distinguishing sparse files from dense files).
+- **Timestamps**:
+  - `atime` (Access Time): Last time file contents were read.
+  - `mtime` (Modification Time): Last time file contents were altered.
+  - `ctime` (Change Time): Last time inode metadata or permissions were modified (cannot be manually forged with `utime()`).
 
-```
-Directory File: /home/alice
-+-------------------+----------------+
-| Inode Number      | Filename       |
-+-------------------+----------------+
-| 1441792           | .              |
-| 2                 | ..             |
-| 1441795           | document.txt   |
-| 1441799           | script.sh      |
-+-------------------+----------------+
-```
-
-When a process calls `open("/home/alice/document.txt", O_RDONLY)`:
-1. The VFS reads root Inode `2` to find the location of `/`.
-2. It parses `/` directory blocks to find entry `home` (Inode `524288`).
-3. It parses `/home` directory blocks to find entry `alice` (Inode `1441792`).
-4. It parses `/home/alice` directory blocks to find entry `document.txt`, discovering Inode `1441795`.
-5. It inspects Inode `1441795` for read permissions and loads data blocks into the Page Cache.
+### The Directory Entry (`struct dentry`)
+A directory is simply a special file containing an array of directory entries. Each entry is a mapping:
+$$\text{Dentry} = (\text{filename}, \text{inode\_number})$$
+When a process opens `/home/user/data.csv`, the kernel traverses the directory tree starting from root (`/`, inode 2 in ext4), reading dentries at each path component until the final inode is resolved.
 
 ---
 
 ## 2. Hard Links vs Symbolic (Soft) Links
 
-Linux provides two distinct mechanisms for referencing files: **Hard Links** and **Symbolic Links**. Understanding their kernel representation is essential for systems programming and data integrity.
-
-```
-                    +---------------------------------------+
-                    |           HARD LINK MECHANICS         |
-                    +---------------------------------------+
-                    
-   Dentry: "file1.txt"                  Dentry: "file1_hard.txt"
-   Inode Ref: 881204                    Inode Ref: 881204
-            \                                  /
-             \                                /
-              v                              v
-            +----------------------------------+
-            |        Inode Number 881204       |
-            | - Size: 4096 bytes               |
-            | - Links Count: 2                 |
-            | - Data Block Pointer: Block 9912 |
-            +----------------------------------+
-                             |
-                             v
-                    [ Data Block 9912 ]
-                    "Hello Production!"
-
-
-                    +---------------------------------------+
-                    |         SOFT (SYMBOLIC) LINK          |
-                    +---------------------------------------+
-
-   Dentry: "file1.txt"                  Dentry: "file1_sym.lnk"
-   Inode Ref: 881204                    Inode Ref: 994511
-            |                                    |
-            v                                    v
-   +------------------+                 +------------------+
-   |   Inode 881204   |                 |   Inode 994511   |
-   | Links Count: 1   |                 | File Type: Symlink|
-   | Block: 9912      |                 | Target: file1.txt|
-   +------------------+                 +------------------+
-            |
-            v
-   [ Data Block 9912 ]
-```
-
-### 2.1 Technical Comparison Table
-
-| Attribute | Hard Link (`ln target link`) | Soft/Symbolic Link (`ln -s target link`) |
+| Metric / Property | Hard Link (`ln target link`) | Symbolic Link (`ln -s target link`) |
 | :--- | :--- | :--- |
-| **Inode Number** | Identical to target file Inode | Brand new, unique Inode allocated |
-| **Storage Usage** | Zero additional disk blocks (new dentry only) | Uses small inode/block storage to store path |
-| **Cross-Filesystem**| **IMPOSSIBLE** (Inodes are local to partition) | **POSSIBLE** (Stores path string) |
-| **Link to Directory**| Forbidden in Linux (prevents cycles/loops) | Permitted |
-| **Target Deleted** | File data preserved; link count decremented | Becomes a **Dangling Link** (Broken reference)|
-| **Permissions** | Shared with target (same inode) | `lrwxrwxrwx` (Kernel evaluates target permissions)|
-| **System Calls** | `link()` | `symlink()` |
+| **Inode Identity** | Identical inode number (`link.i_ino == target.i_ino`) | Distinct new inode allocated (`link.i_ino != target.i_ino`) |
+| **Link Count (`i_nlink`)** | Increments target inode's `i_nlink` by 1 | Target inode `i_nlink` is unchanged; symlink inode has `i_nlink = 1` |
+| **Cross-Filesystem** | **IMPOSSIBLE**. Inode numbers are only local to a superblock. | **POSSIBLE**. Contains arbitrary text pathname string. |
+| **Directories** | Forbidden to userspace (prevents cycles in DAG). | Allowed (can point to directories). |
+| **Target Deletion** | Target data remains accessible via link; blocks intact. | Becomes dangling / broken link (points to non-existent path). |
+| **Storage Overhead** | Exactly 0 extra disk blocks (adds one dentry to directory). | Fast symlink: 0 blocks (< 60 bytes stored in inode `i_block`). Slow: 1 block. |
+| **Kernel Resolution** | Direct dereference via dentry cache. | Kernel must resolve path string recursively (up to `SYMLOOP_MAX = 40`). |
 
-### 2.2 Mathematical Proof: Why Hard Links Cannot Cross Filesystems
-Every storage partition format (e.g. `/dev/sda1` on `/` vs `/dev/sdb1` on `/data`) initializes its own independent **Inode Table**.
-- In `/dev/sda1`, Inode `105` may reference `/etc/passwd`.
-- In `/dev/sdb1`, Inode `105` may reference an arbitrary database block or picture.
+### Fast Symlinks vs Slow Symlinks
+In ext4 filesystems, an inode has a 60-byte data field (`i_block` array) originally used for direct and indirect block pointers.
+- **Fast Symlink**: If the symlink target pathname is less than 60 bytes (including the null terminator), ext4 stores the target string directly inside the inode's `i_block` array. Zero data blocks are allocated on disk!
+- **Slow Symlink**: If the target pathname is $\ge 60$ bytes, ext4 allocates a dedicated data block on disk, writes the path string there, and points the inode's extent tree to that block.
 
-Because a directory entry only records an integer Inode number, creating a hard link across filesystems would point to an arbitrary, uncoordinated Inode on the target filesystem. Hence, the VFS checks `old_dentry->d_sb == new_dentry->d_sb`. If the superblock pointers differ, the kernel immediately aborts with `EXDEV` (**Invalid cross-device link**).
+### Directory Link Count Rules
+For any directory `mydir`:
+$$i\_nlink(\text{mydir}) = 2 + \text{Number of Immediate Subdirectories}$$
+Why?
+1. The parent directory contains an entry for `mydir` ($+1$).
+2. The directory `mydir` contains an entry pointing to itself: `.` ($+1$).
+3. Every immediate subdirectory inside `mydir` contains an entry pointing back to the parent: `..` ($+1$ for each).
 
 ---
 
-## 3. Dissecting `stat` and Inode Exhaustion
+## 3. POSIX System Calls: stat(), lstat(), readlink(), link(), unlink()
 
-The `stat` utility directly reads an Inode's metadata fields using the `statx()` or `stat()` system call:
+```c
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-```bash
-$ stat production.log
-  File: production.log
-  Size: 10485760   	Blocks: 20480      IO Block: 4096   regular file
-Device: 801h/2049d	Inode: 2883921     Links: 1
-Access: (0644/-rw-r--r--)  Uid: ( 1000/   alice)   Gid: ( 1000/   alice)
-Access: 2026-11-23 08:30:00.124589123 +0000
-Modify: 2026-11-23 08:29:55.981245100 +0000
-Change: 2026-11-23 08:29:55.981245100 +0000
- Birth: 2026-11-23 08:00:00.000000000 +0000
+struct stat {
+    dev_t     st_dev;     /* ID of device containing file */
+    ino_t     st_ino;     /* Inode number */
+    mode_t    st_mode;    /* File type and mode */
+    nlink_t   st_nlink;   /* Number of hard links */
+    uid_t     st_uid;     /* User ID of owner */
+    gid_t     st_gid;     /* Group ID of owner */
+    dev_t     st_rdev;    /* Device ID (if special file) */
+    off_t     st_size;    /* Total size, in bytes */
+    blksize_t st_blksize; /* Block size for filesystem I/O */
+    blkcnt_t  st_blocks;  /* Number of 512B blocks allocated */
+    struct timespec st_atim;  /* Time of last access */
+    struct timespec st_mtim;  /* Time of last modification */
+    struct timespec st_ctim;  /* Time of last status change */
+};
+```
+- `stat(pathname, &sb)`: Dereferences symbolic links. If `pathname` is a symlink, returns the metadata of the file the symlink points to.
+- `lstat(pathname, &sb)`: Does NOT dereference symbolic links. Returns the metadata of the symlink file itself!
+- `readlink(pathname, buf, bufsiz)`: Reads the content (target path) of a symbolic link without following it.
+- `link(oldpath, newpath)`: Creates a hard link pointing to the inode of `oldpath`.
+- `unlink(pathname)`: Removes a dentry. Decrements the referenced inode's `i_nlink`. If `i_nlink == 0` and no process has it open, the kernel frees the blocks.
+
+---
+
+## 4. Production Masterclass: Compilable C Program
+
+Save as `inode_inspector.c` and compile with `gcc -Wall -Wextra -O2 inode_inspector.c -o inode_inspector`:
+
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <time.h>
+
+void print_file_stat(const char *label, const char *path) {
+    struct stat sb;
+    if (lstat(path, &sb) == -1) {
+        fprintf(stderr, "[-] lstat failed on %s: %s\\n", path, strerror(errno));
+        return;
+    }
+
+    printf("====================================================\\n");
+    printf("STAT REPORT: %s (%s)\\n", label, path);
+    printf("====================================================\\n");
+    printf("  Device ID (st_dev)    : Major=%ld, Minor=%ld\\n",
+           (long)major(sb.st_dev), (long)minor(sb.st_dev));
+    printf("  Inode Number (st_ino) : %llu\\n", (unsigned long long)sb.st_ino);
+    printf("  Hard Link Count       : %lu\\n", (unsigned long)sb.st_nlink);
+    printf("  Logical Size          : %lld bytes\\n", (long long)sb.st_size);
+    printf("  Disk Blocks (512B)    : %lld blocks (%lld physical bytes)\\n",
+           (long long)sb.st_blocks, (long long)sb.st_blocks * 512);
+
+    // Decode File Type
+    const char *ftype = "Unknown";
+    if (S_ISREG(sb.st_mode))  ftype = "Regular File";
+    else if (S_ISDIR(sb.st_mode))  ftype = "Directory";
+    else if (S_ISLNK(sb.st_mode))  ftype = "Symbolic Link";
+    else if (S_ISCHR(sb.st_mode))  ftype = "Character Device";
+    else if (S_ISBLK(sb.st_mode))  ftype = "Block Device";
+    else if (S_ISFIFO(sb.st_mode)) ftype = "FIFO/Named Pipe";
+    else if (S_ISSOCK(sb.st_mode)) ftype = "Socket";
+
+    printf("  File Type             : %s\\n", ftype);
+    printf("  POSIX Permissions     : %04o\\n", sb.st_mode & 07777);
+
+    // If symlink, inspect its raw target
+    if (S_ISLNK(sb.st_mode)) {
+        char link_target[1024];
+        ssize_t len = readlink(path, link_target, sizeof(link_target) - 1);
+        if (len != -1) {
+            link_target[len] = '\\0';
+            printf("  Symlink Points To     : \"%s\"\\n", link_target);
+            printf("  Storage Location      : %s\\n",
+                   sb.st_blocks == 0 ? "Fast Symlink (inside inode i_block)" : "Slow Symlink (data block)");
+        }
+    }
+}
+
+int main(void) {
+    const char *orig_file = "test_original.bin";
+    const char *hard_link = "test_hardlink.bin";
+    const char *soft_link = "test_softlink.bin";
+
+    // Clean up any stale artifacts
+    unlink(orig_file);
+    unlink(hard_link);
+    unlink(soft_link);
+
+    printf("[+] Step 1: Creating original file '%s' (8192 bytes)...\\n", orig_file);
+    int fd = open(orig_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) { perror("open"); return 1; }
+    char buffer[4096];
+    memset(buffer, 0xAA, sizeof(buffer));
+    write(fd, buffer, sizeof(buffer));
+    write(fd, buffer, sizeof(buffer));
+    close(fd);
+
+    print_file_stat("Original File Initial", orig_file);
+
+    printf("\\n[+] Step 2: Creating hard link '%s' -> '%s'...\\n", hard_link, orig_file);
+    if (link(orig_file, hard_link) == -1) {
+        perror("link");
+    }
+    print_file_stat("Original File After Hardlink", orig_file);
+    print_file_stat("Hard Link", hard_link);
+
+    printf("\\n[+] Step 3: Creating symbolic link '%s' -> '%s'...\\n", soft_link, orig_file);
+    if (symlink(orig_file, soft_link) == -1) {
+        perror("symlink");
+    }
+    print_file_stat("Original File After Symlink", orig_file);
+    print_file_stat("Symbolic Link", soft_link);
+
+    printf("\\n[+] Step 4: Deleting (unlinking) original file '%s'...\\n", orig_file);
+    unlink(orig_file);
+
+    print_file_stat("Hard Link After Original Unlinked", hard_link);
+    print_file_stat("Symbolic Link After Original Unlinked (Dangling)", soft_link);
+
+    // Clean up
+    unlink(hard_link);
+    unlink(soft_link);
+    printf("\\n[+] Demonstration successfully concluded.\\n");
+    return 0;
+}
 ```
 
-### Understanding Timestamps:
-- **`Access` (`atime`)**: Last time the file was read via `read()` or `execve()`. (Frequently configured with `noatime` or `relatime` in `/etc/fstab` to eliminate write amplification).
-- **`Modify` (`mtime`)**: Last time file *content* was modified via `write()` or `truncate()`.
-- **`Change` (`ctime`)**: Last time file *metadata or inode properties* were changed (e.g. `chmod`, `chown`, link count change). **`ctime` cannot be forged by user processes.**
-- **`Birth` (`crtime`)**: Creation timestamp (supported in ext4 and Btrfs via `statx`).
+---
 
-### 3.1 The "Disk Full" Inode Exhaustion Catastrophe
-A filesystem can completely run out of space even if terabytes of free disk space remain!
-When ext4 is formatted via `mkfs.ext4`, it preallocates a fixed number of Inodes based on partition size. If an application generates millions of zero-byte or tiny files (e.g. unpruned PHP session files or microservice logs), every Inode is consumed.
-
-```bash
-# Check block space usage:
-$ df -h /
+## 5. Production Post-Mortem: The Ghost Disk Full Incident
+### The Outage
+A high-throughput Cassandra cluster node triggered an emergency alert: `Disk Space Usage: 100% (/var/log partition)`.
+An on-call engineer connected to the node, ran `du -sh /var/log/*`, and observed only 1.2 GB of disk usage. Yet `df -h /var/log` reported:
+```
 Filesystem      Size  Used Avail Use% Mounted on
-/dev/sda1        50G   12G   38G  24% /
-
-# Check Inode usage:
-$ df -i /
-Filesystem      Inodes   IUsed   IFree IUse% Mounted on
-/dev/sda1      3276800 3276800       0  100% /   <-- DISK IS FULL!
+/dev/nvme0n1p2  200G  198G     0 100% /var/log
 ```
-When Inode utilization reaches $100\%$, any attempt to create a file (`touch`, `mkdir`, `creat()`) fails with `ENOSPC` (**No space left on device**), crashing databases and daemons.
+The engineer ran `rm -f /var/log/cassandra/system.log`, expecting 50 GB to be reclaimed immediately. Nothing changed: `df -h` still showed 100% full. New database writes stalled, and the node collapsed into a crash loop.
 
----
+### Root Cause Analysis
+The filesystem releases an inode's storage blocks if and only if two conditions are met simultaneously:
+1. `inode->i_nlink == 0` (all directory entries have been unlinked).
+2. `inode->i_count == 0` (the kernel reference count in the open file table reaches zero, meaning no active processes have open file descriptors to the inode).
 
-## 4. Production War Story: The Unlinked Open File Disk Leak
+The engineer used `rm`, which invokes `unlink("/var/log/cassandra/system.log")`. This successfully decremented `i_nlink` from 1 to 0 and removed the dentry from the directory tree. Consequently, `du` (which traverses the directory tree using `opendir`/`readdir`) could no longer see the file!
+However, the active Cassandra JVM process still held an open file descriptor (`fd = 19`) to that unlinked inode. The inode remained pinned in kernel memory, and the 50 GB of disk blocks remained reserved and active!
 
-A high-frequency trading platform reported that its `/var/log` partition was running out of disk space (`98%` capacity). SREs ran `rm /var/log/trading_engine.log` to delete a $40\text{ GB}$ log file. 
+### Diagnostic Verification
+```bash
+# Locate all open file descriptors referencing deleted inodes
+lsof +L1 /var/log
+# OR via procfs:
+ls -l /proc/*/fd/* | grep '(deleted)'
+```
+Output:
+```
+COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF   NODE NAME
+java    18241 cass   19w   REG  259,2 52428800000 142091 /var/log/cassandra/system.log (deleted)
+```
 
-### The Mystery
-Running `df -h /var/log` still showed $98\%$ disk utilization! However, running `ls -l /var/log/` showed that the file was completely gone. Where did the $40\text{ GB}$ go?
-
-### Kernel Mechanics Explained
-When `rm` is executed, it calls the `unlink()` system call. `unlink()` removes the directory entry mapping and decrements the Inode's `i_links_count`. However:
-**The Linux kernel will NOT deallocate a file's physical data blocks while any process holds an active open File Descriptor pointing to that Inode!**
-
-Because the trading engine daemon was still running and writing to file descriptor `3`, `i_links_count` dropped from $1$ to $0$, but the kernel kept the data blocks allocated on disk.
-
-### The Diagnostic & Resolution
-1. **Find Unlinked Open Files**:
+### Remediation & Permanent Architectural Fix
+1. **Immediate Zero-Downtime Release**: Instead of attempting to kill the critical service, truncate the unlinked file through `/proc`:
    ```bash
-   lsof | grep deleted
-   trading_e  4812  root    3w   REG  8,1  42949672960  184912 /var/log/trading_engine.log (deleted)
+   # Truncate the file via the process's file descriptor entry in procfs:
+   : > /proc/18241/fd/19
    ```
-2. **Reclaim Disk Space Without Stopping Daemon**:
-   Truncate the unlinked file through the `/proc` virtual filesystem:
-   ```bash
-   : > /proc/4812/fd/3
-   ```
-   The kernel immediately truncated the allocated ext4 extent blocks to $0$ bytes, freeing $40\text{ GB}$ instantly while allowing the production daemon to continue operating uninterrupted.
+   This invokes `ftruncate()`, releasing all extents back to the free block bitmap without restarting Cassandra.
+2. **Proper Log Rotation Architecture**:
+   Never use `rm` on active log files. Use `logrotate` with `copytruncate` or configure services to respond to `SIGHUP` (e.g. Nginx `kill -USR1`) to reopen their file descriptors after rename.
